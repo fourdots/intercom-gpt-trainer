@@ -1,0 +1,28 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/intercom-gpt-bridge:$COMMIT_SHA', '.']
+
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/intercom-gpt-bridge:$COMMIT_SHA']
+
+  # Deploy container image to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'intercom-gpt-bridge'
+      - '--image=gcr.io/$PROJECT_ID/intercom-gpt-bridge:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--memory=512Mi'
+      - '--concurrency=10'
+      - '--timeout=300'
+      - '--set-env-vars=POLLING_INTERVAL=60,USE_SECRET_MANAGER=true,PROJECT_ID=$PROJECT_ID'
+      - '--min-instances=1'
+      - '--max-instances=3'
+
+images:
+  - 'gcr.io/$PROJECT_ID/intercom-gpt-bridge:$COMMIT_SHA'

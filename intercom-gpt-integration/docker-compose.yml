@@ -1,0 +1,27 @@
+version: '3'
+
+services:
+  intercom-gpt-integration:
+    build: .
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - USE_SECRET_MANAGER=false
+      - PORT=8080
+    restart: unless-stopped
+
+  # For building the container for Google Cloud
+  cloud-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gcr.io/${PROJECT_ID:-intercom-gpt-integration}/intercom-gpt-bridge:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - USE_SECRET_MANAGER=true
+      - PORT=8080 

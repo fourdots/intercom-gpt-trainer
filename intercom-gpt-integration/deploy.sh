@@ -45,8 +45,8 @@ gcloud run deploy intercom-gpt-bridge \
   --memory 512Mi \
   --concurrency 10 \
   --timeout 300 \
-  --set-env-vars="POLLING_INTERVAL=60,USE_SECRET_MANAGER=true,PROJECT_ID=$PROJECT_ID" \
-  --min-instances=1 \
+  --set-env-vars="POLLING_INTERVAL=60,USE_SECRET_MANAGER=true,PROJECT_ID=$PROJECT_ID,BASE_INTERCOM_CLIENT_ID=c900675b-8328-4c2d-8ee5-a3d07ce72e9d,BASE_INTERCOM_CLIENT_SECRET=712646ac-659d-49f6-8f49-fc1446c4013e,WEBHOOK_BASE_URL=https://intercom-gpt-bridge-7dcghnke4a-uc.a.run.app" \
+  --min-instances=2 \
   --max-instances=3
 print_success "Deployment successful!"
 

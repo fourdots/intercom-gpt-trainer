@@ -14,11 +14,15 @@ import requests
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def test_connection(platform_name, access_token, admin_id):
+def test_connection(platform_name, access_token, admin_id, api_url=None):
     """Test connection to Intercom API for a specific platform"""
     logger.info(f"=== Testing {platform_name} Intercom Connection ===")
     logger.info(f"Using Intercom Admin ID: {admin_id}")
     logger.info(f"Intercom Token (truncated): {access_token[:10]}...")
+    
+    # Use the provided API URL or default to the standard Intercom API
+    base_url = api_url or "https://api.intercom.io"
+    logger.info(f"Using API base URL: {base_url}")
     
     # Setup headers
     headers = {
@@ -30,7 +34,7 @@ def test_connection(platform_name, access_token, admin_id):
     try:
         # 1. List conversations
         logger.info("Testing Intercom API - Listing conversations...")
-        list_url = "https://api.intercom.io/conversations"
+        list_url = f"{base_url}/conversations"
         params = {
             "per_page": 10,
             "state": "open",
@@ -61,7 +65,7 @@ def test_connection(platform_name, access_token, admin_id):
         
         # 3. Get full conversation details
         logger.info(f"Getting full details for conversation {conversation_id}...")
-        detail_url = f"https://api.intercom.io/conversations/{conversation_id}"
+        detail_url = f"{base_url}/conversations/{conversation_id}"
         
         detail_response = requests.get(detail_url, headers=headers)
         logger.info(f"Response status: {detail_response.status_code}")
@@ -72,42 +76,23 @@ def test_connection(platform_name, access_token, admin_id):
         
         logger.info(f"{platform_name} connection test successful!")
         return True
-        
+    
     except Exception as e:
-        logger.error(f"Error during test: {str(e)}", exc_info=True)
+        logger.error(f"Error testing connection to {platform_name}: {e}")
         return False
 
-def main():
+if __name__ == "__main__":
     # Load environment variables
     load_dotenv()
     
-    # Get Reportz Intercom credentials
-    reportz_token = os.getenv("INTERCOM_ACCESS_TOKEN")
-    reportz_admin_id = os.getenv("INTERCOM_ADMIN_ID")
+    # Get configuration
+    reportz_token = os.environ.get("INTERCOM_ACCESS_TOKEN")
+    base_token = os.environ.get("BASE_INTERCOM_ACCESS_TOKEN")
+    base_api_url = os.environ.get("BASE_INTERCOM_API_URL")
+    admin_id = os.environ.get("INTERCOM_ADMIN_ID")
     
-    # Get Base Intercom credentials
-    base_token = os.getenv("BASE_INTERCOM_ACCESS_TOKEN")
-    base_admin_id = os.getenv("INTERCOM_ADMIN_ID")  # Using same admin ID for now
+    # Test Reportz Intercom connection
+    test_connection("Reportz", reportz_token, admin_id)
     
-    success = True
-    
-    # Test Reportz connection
-    if reportz_token and reportz_admin_id:
-        if not test_connection("Reportz", reportz_token, reportz_admin_id):
-            success = False
-    else:
-        logger.error("Missing required Reportz Intercom credentials in environment variables")
-        success = False
-    
-    # Test Base connection
-    if base_token and base_admin_id:
-        if not test_connection("Base", base_token, base_admin_id):
-            success = False
-    else:
-        logger.error("Missing required Base Intercom credentials in environment variables")
-        success = False
-    
-    return 0 if success else 1
-
-if __name__ == "__main__":
-    exit(main()) 
+    # Test Base Intercom connection
+    test_connection("Base", base_token, admin_id, base_api_url) 

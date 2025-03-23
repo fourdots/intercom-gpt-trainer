@@ -8,6 +8,7 @@ import urllib.parse
 import requests
 import time
 import threading
+import re  # Add re import for Mem0 integration
 from datetime import datetime
 from flask import Flask, request, jsonify, redirect, url_for, session
 from dotenv import load_dotenv
@@ -119,6 +120,146 @@ logger.info(f"Application startup at timestamp: {app.start_time}")
 # Store cold start times for recent instances
 cold_start_history = []
 MAX_COLD_START_HISTORY = 10
+
+# Mem0 Helper Functions
+def get_mem0_credentials():
+    """Get Mem0 credentials from Secret Manager"""
+    if os.getenv('USE_SECRET_MANAGER', 'false').lower() == 'true':
+        try:
+            from utils.secrets_manager import SecretsManager
+            
+            # Create a SecretsManager instance
+            project_id = os.getenv('PROJECT_ID', 'intercom-gpt-trainer')
+            secrets_manager = SecretsManager(project_id)
+            
+            api_key = secrets_manager.get_secret("mem0-api-key")
+            org_id = secrets_manager.get_secret("mem0-org-id")
+            project_id = secrets_manager.get_secret("mem0-project-id")
+            
+            # Set in environment for easier access
+            os.environ["MEM0_API_KEY"] = api_key if api_key else ""
+            os.environ["MEM0_ORG_ID"] = org_id if org_id else ""
+            os.environ["MEM0_PROJECT_ID"] = project_id if project_id else ""
+            
+            return api_key, org_id, project_id
+        except Exception as e:
+            logger.error(f"Error getting Mem0 credentials from Secret Manager: {e}")
+    
+    # Fall back to environment variables
+    return (
+        os.environ.get("MEM0_API_KEY", ""),
+        os.environ.get("MEM0_ORG_ID", ""),
+        os.environ.get("MEM0_PROJECT_ID", "")
+    )
+
+def add_to_mem0(messages, user_id, metadata=None):
+    """Add messages to Mem0"""
+    if metadata is None:
+        metadata = {}
+        
+    # Get credentials
+    api_key, org_id, project_id = get_mem0_credentials()
+    if not api_key:
+        logger.error("No Mem0 API key available")
+        return None
+        
+    # Prepend 'intercom_' to user_id to make it more identifiable if it's not already
+    if not user_id.startswith('intercom_'):
+        user_id = f"intercom_{user_id}"
+    
+    # Ensure both org_id and project_id are present in the request
+    if not org_id or not project_id:
+        logger.error("Both org_id and project_id must be provided for Mem0 integration")
+        return None
+
+    url = "https://api.mem0.ai/v1/memories/"
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messages": messages,
+        "user_id": user_id,
+        "metadata": metadata,
+        "org_id": org_id,
+        "project_id": project_id,
+        "version": "v2"
+    }
+    
+    # Debug log the payload (excluding sensitive data)
+    logger.debug(f"Sending memory for user {user_id} with metadata: {metadata}")
+    
+    try:
+        logger.info(f"Adding memory for user {user_id}")
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        logger.info(f"Successfully added memory for user {user_id}")
+        
+        # Return True even if response body is empty but status is 200
+        if response.status_code == 200:
+            return True
+            
+        # Try to parse JSON response
+        try:
+            return response.json()
+        except:
+            return True  # Return True for success even if response is not JSON
+    except Exception as e:
+        logger.error(f"Error adding memory to Mem0: {e}")
+        return None
+
+def search_mem0(query, user_id):
+    """Search Mem0 for relevant memories"""
+    # Get credentials
+    api_key, org_id, project_id = get_mem0_credentials()
+    if not api_key:
+        logger.error("No Mem0 API key available")
+        return []
+        
+    # Prepend 'intercom_' to user_id to make it more identifiable if it's not already
+    if not user_id.startswith('intercom_'):
+        user_id = f"intercom_{user_id}"
+        
+    # Ensure both org_id and project_id are present in the request
+    if not org_id or not project_id:
+        logger.error("Both org_id and project_id must be provided for Mem0 search")
+        return []
+
+    url = "https://api.mem0.ai/v2/memories/search/"
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "query": query,
+        "filters": {
+            "user_id": user_id
+        },
+        "org_id": org_id,
+        "project_id": project_id
+    }
+    
+    # Debug log the search query (excluding sensitive data)
+    logger.debug(f"Searching memories for user {user_id} with query: {query[:50]}...")
+    
+    try:
+        logger.info(f"Searching memories for user {user_id} with query: {query}")
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        logger.info(f"Successfully searched memories for user {user_id}")
+        
+        # Handle empty results
+        if response.text.strip() == '[]':
+            return []
+            
+        # Try to parse JSON response
+        try:
+            return response.json()
+        except:
+            return []  # Return empty list if response is not valid JSON
+    except Exception as e:
+        logger.error(f"Error searching Mem0: {e}")
+        return []
 
 @app.before_request
 def before_request():
@@ -498,6 +639,36 @@ def ensure_valid_session(conversation_id):
             logger.error(f"DEBUG - Exception details:", exc_info=True)
             return None
 
+def verify_webhook_signature_with_secret(payload, signature_header, secret):
+    """Verify that the webhook request is from Intercom using a specific client secret"""
+    if not secret:
+        logger.warning("No client secret provided for signature verification")
+        return False
+    
+    if not signature_header:
+        logger.warning("No signature header in request")
+        return False
+    
+    if not signature_header.startswith('sha1='):
+        logger.warning("Invalid signature format")
+        return False
+    
+    signature = signature_header[5:]  # Remove 'sha1=' prefix
+    
+    # Create hmac with the provided client secret
+    mac = hmac.new(
+        secret.encode('utf-8'),
+        msg=payload.encode('utf-8'),
+        digestmod=hashlib.sha1
+    )
+    
+    # Compare signatures
+    calculated_signature = mac.hexdigest()
+    logger.debug(f"Calculated signature: {calculated_signature}")
+    logger.debug(f"Received signature: {signature}")
+    
+    return hmac.compare_digest(calculated_signature, signature)
+
 def track_performance(metric_name, start_time, conversation_id=None, event_description=None):
     """Track performance metrics with enhanced timeline tracking"""
     global conversation_timelines
@@ -639,6 +810,22 @@ def process_message_batch(conversation_id):
             logger.info(f"DEBUG - Using platform-specific Intercom API client from batch data")
             break
     
+    # Also check for platform in messages
+    platform = None
+    for msg in messages:
+        if isinstance(msg, dict) and 'metadata' in msg and 'platform' in msg['metadata']:
+            platform = msg['metadata']['platform']
+            logger.info(f"DEBUG - Found platform '{platform}' in message metadata")
+            break
+    
+    # If we found a platform in metadata but don't have an API client yet, initialize one
+    if platform and not current_intercom_api:
+        if platform == 'base':
+            logger.info(f"DEBUG - Creating Base Intercom API client based on message metadata")
+            base_token = os.environ.get("BASE_INTERCOM_ACCESS_TOKEN")
+            base_api_url = os.environ.get("BASE_INTERCOM_API_URL")
+            current_intercom_api = IntercomAPI(base_token, intercom_admin_id, base_url=base_api_url)
+    
     if not current_intercom_api:
         logger.info(f"DEBUG - No platform-specific API client found in batch data, using default")
         current_intercom_api = intercom_api
@@ -687,13 +874,56 @@ def process_message_batch(conversation_id):
         
         # Combine all messages into a single text
         message_processing_start = time.time()
-        combined_message = "\n".join([f"{msg}" for msg in messages])
-        logger.info(f"Combined {len(messages)} messages for processing: {combined_message[:100]}...")
+        
+        # Extract text from each message (handling both formats)
+        extracted_messages = []
+        for msg in messages:
+            message_text = extract_message_text(msg)
+            if message_text:
+                extracted_messages.append(message_text)
+        
+        combined_message = "\n".join(extracted_messages)
+        logger.info(f"Combined {len(extracted_messages)} messages for processing: {combined_message[:100]}...")
         
         # Clean the message using the improved HTML-aware cleaner
         clean_message = message_processor.clean_message_body(combined_message)
         track_performance('message_processing', message_processing_start, conversation_id,
                          event_description=f"Processed {len(messages)} messages into single query")
+        
+        # Check if we have memory context to add to the prompt
+        memory_context = ""
+        user_info = {}
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get('metadata', {}):
+                metadata = msg.get('metadata', {})
+                if metadata.get('memory_context'):
+                    memory_context = metadata.get('memory_context')
+                    logger.info(f"Found memory context to add to prompt for conversation {conversation_id}")
+                
+                if metadata.get('user_info'):
+                    user_info = metadata.get('user_info')
+                    logger.info(f"Found user info to add to prompt for conversation {conversation_id}")
+        
+        # Create a context prompt with user information and memory context
+        context_prompt = ""
+        
+        # Add user information to the prompt if available
+        if user_info:
+            context_prompt += "CONVERSATION CONTEXT:\n"
+            context_prompt += f"User: {user_info.get('name', 'Unknown')}\n"
+            if user_info.get('email'):
+                context_prompt += f"Email: {user_info.get('email')}\n"
+            context_prompt += f"Platform: {user_info.get('platform', 'Unknown')}\n\n"
+        
+        # Add memory context if available
+        if memory_context:
+            context_prompt += memory_context + "\n\n"
+        
+        # If we have context, prepend it to the clean message
+        if context_prompt:
+            clean_message = context_prompt + clean_message
+            logger.info(f"Added context to prompt for conversation {conversation_id}")
+            logger.debug(f"Context prompt: {context_prompt}")
         
         # Ensure we have a valid session
         session_start_time = time.time()
@@ -752,6 +982,45 @@ def process_message_batch(conversation_id):
                                message_count=len(messages),
                                queue_time_s=batch_queue_time,
                                response_length=len(gpt_response))
+            
+            # Store the conversation in Mem0
+            mem0_start_time = time.time()
+            
+            # Prepare message data for Mem0
+            mem0_messages = [
+                {
+                    "role": "user",
+                    "content": message_processor.clean_message_body(combined_message)
+                },
+                {
+                    "role": "assistant",
+                    "content": gpt_response
+                }
+            ]
+            
+            # Add metadata
+            mem0_metadata = {
+                "timestamp": datetime.now().isoformat(),
+                "conversation_id": conversation_id,
+                "platform": user_info.get('platform', 'unknown')
+            }
+            
+            # Add user information to metadata if available
+            if user_info:
+                mem0_metadata.update({
+                    "user_name": user_info.get('name', 'Unknown User'),
+                    "user_email": user_info.get('email', ''),
+                    "platform": user_info.get('platform', 'unknown')
+                })
+            
+            # Store in Mem0
+            mem0_result = add_to_mem0(mem0_messages, conversation_id, mem0_metadata)
+            
+            if mem0_result:
+                logger.info(f"Successfully stored conversation {conversation_id} in Mem0")
+            
+            track_performance('mem0_storage', mem0_start_time, conversation_id,
+                            event_description="Stored conversation in Mem0")
             
         except Exception as e:
             logger.error(f"Error sending response to Intercom: {str(e)}")
@@ -853,6 +1122,7 @@ def get_platform_specific_intercom_api(conversation=None, workspace=None):
     
     # Get Base.me token directly from environment variable
     base_token = os.environ.get("BASE_INTERCOM_ACCESS_TOKEN")
+    base_api_url = os.environ.get("BASE_INTERCOM_API_URL", "https://api.intercom.io")
     
     # Log token availability for debugging
     if base_token:
@@ -872,15 +1142,26 @@ def get_platform_specific_intercom_api(conversation=None, workspace=None):
         except Exception as e:
             logger.error(f"Error getting Base.me token from Secret Manager: {e}")
     
+    
     # If workspace is explicitly specified as "base", use Base
     if workspace and workspace.lower() == "base":
         is_base = True
         logger.info("Base.me platform selected by workspace parameter")
     
+    # Check for specific app_id that identifies Base workspace
+    elif conversation and 'app_id' in conversation and conversation['app_id'] == 'ol9hno6x':
+        is_base = True
+        logger.info("Base.me platform detected from app_id exact match")
+    
     # If we have a conversation object, try to determine which platform it belongs to
     elif conversation:
+        # Check if app_id is in the conversation
+        app_id = conversation.get('app_id')
+        if app_id and app_id == 'ol9hno6x':
+            is_base = True
+            logger.info(f"Base.me platform detected from conversation app_id: {app_id}")
+        
         # Look for platform specific identifiers in the conversation 
-        # (You might need to adjust this logic based on your actual data)
         conversation_tags = conversation.get("tags", {}).get("tags", [])
         if any(tag.get("name", "").lower() == "base.me" for tag in conversation_tags):
             is_base = True
@@ -899,11 +1180,19 @@ def get_platform_specific_intercom_api(conversation=None, workspace=None):
             if email and ("base.me" in email or "@base." in email):
                 is_base = True
                 logger.info("Base.me platform detected from customer email")
+                
+        # Check source URL if available
+        source = conversation.get("source", {})
+        if source and isinstance(source, dict):
+            url = source.get("url", "")
+            if url and "base.me" in url:
+                is_base = True
+                logger.info(f"Base.me platform detected from source URL: {url}")
     
     # Create and return the appropriate API client
     if is_base and base_token:
         logger.info("Using Base.me Intercom API client")
-        return IntercomAPI(base_token, default_admin_id)
+        return IntercomAPI(base_token, default_admin_id, base_url=base_api_url)
     
     logger.info("Using Reportz.io Intercom API client")
     return IntercomAPI(default_token, default_admin_id)
@@ -923,7 +1212,18 @@ def webhook_handler():
     reportz_secret = os.environ.get("INTERCOM_CLIENT_SECRET", "NOT_AVAILABLE")  
     base_secret = os.environ.get("BASE_INTERCOM_CLIENT_SECRET", "NOT_AVAILABLE")
     
-    logger.info(f"Token availability - Reportz: {'Available' if reportz_token != 'NOT_AVAILABLE' else 'NOT AVAILABLE'}, Base: {'Available' if base_token != 'NOT_AVAILABLE' else 'NOT AVAILABLE'}")
+    # Log more detailed token information (truncated for security)
+    if reportz_token != "NOT_AVAILABLE":
+        reportz_token_display = f"{reportz_token[:10]}...{reportz_token[-10:]}"
+    else:
+        reportz_token_display = "NOT_AVAILABLE"
+        
+    if base_token != "NOT_AVAILABLE":
+        base_token_display = f"{base_token[:10]}...{base_token[-10:]}"
+    else:
+        base_token_display = "NOT_AVAILABLE"
+        
+    logger.info(f"Token details - Reportz: {reportz_token_display}, Base: {base_token_display}")
     logger.info(f"Secret availability - Reportz: {'Available' if reportz_secret != 'NOT_AVAILABLE' else 'NOT AVAILABLE'}, Base: {'Available' if base_secret != 'NOT_AVAILABLE' else 'NOT AVAILABLE'}")
     
     # Additional debug info
@@ -935,44 +1235,72 @@ def webhook_handler():
     signature_header = request.headers.get('X-Hub-Signature')
     logger.debug(f"Received signature header: {signature_header}")
     
-    # First look for clues in the payload to determine which client secret to try first
+    # Try to determine the platform from the payload first
     try:
         payload_data = json.loads(payload)
         app_id = payload_data.get('app_id', '')
         workspace_id = payload_data.get('data', {}).get('item', {}).get('workspace_id', '')
         
-        # Determine which client secret to try first
-        use_base_first = False
-        if app_id and 'base' in app_id.lower():
-            use_base_first = True
+        # Log app_id and workspace_id for debugging
+        logger.info(f"Webhook app_id: '{app_id}', workspace_id: '{workspace_id}'")
+        
+        # Determine platform
+        is_base = False
+        if app_id == 'ol9hno6x':
+            is_base = True
+            logger.info("Detected Base webhook based on app_id exact match")
+        elif 'base' in app_id.lower():
+            is_base = True
             logger.info("Detected potential Base webhook from app_id, will try Base client secret first")
         elif workspace_id and 'base' in workspace_id.lower():
-            use_base_first = True
+            is_base = True
             logger.info("Detected potential Base webhook from workspace_id, will try Base client secret first")
-            
-        if use_base_first:
-            # First try Base, then Reportz
-            secrets_to_try = [(base_secret, "Base"), (reportz_secret, "Reportz")]
-        else:
-            # First try Reportz, then Base
-            secrets_to_try = [(reportz_secret, "Reportz"), (base_secret, "Base")]
-            
-        # Try each client secret
-        for secret, name in secrets_to_try:
-            if secret and verify_webhook_signature_with_secret(payload, signature_header, secret):
-                logger.info(f"Webhook signature verified with {name} client secret")
-                return True
-                
-        # If we got here, neither secret worked
-        logger.error(f"Invalid webhook signature. Got: {signature_header}")
-        return jsonify({"error": "Invalid signature"}), 401
         
+        # Select the appropriate client secret
+        if is_base:
+            # Use Base client secret
+            if base_secret != "NOT_AVAILABLE":
+                client_secret = base_secret
+                logger.info("Using Base client secret for webhook verification")
+            else:
+                logger.warning("Base webhook detected but no Base client secret available")
+                client_secret = reportz_secret  # Fall back to Reportz secret
+        else:
+            # Use Reportz client secret
+            client_secret = reportz_secret
+            logger.info("Using Reportz client secret for webhook verification")
+        
+        # Try to verify with the selected client secret
+        if verify_webhook_signature_with_secret(payload, signature_header, client_secret):
+            logger.info(f"Webhook signature verified successfully")
+        else:
+            # If verification fails with the first secret, try the other one
+            if is_base and reportz_secret != "NOT_AVAILABLE":
+                logger.info("First verification failed, trying Reportz client secret as fallback")
+                if verify_webhook_signature_with_secret(payload, signature_header, reportz_secret):
+                    logger.info("Webhook signature verified with Reportz client secret")
+                else:
+                    logger.error(f"Invalid webhook signature with both secrets. Got: {signature_header}")
+                    return jsonify({"error": "Invalid signature"}), 401
+            elif not is_base and base_secret != "NOT_AVAILABLE":
+                logger.info("First verification failed, trying Base client secret as fallback")
+                if verify_webhook_signature_with_secret(payload, signature_header, base_secret):
+                    logger.info("Webhook signature verified with Base client secret")
+                else:
+                    logger.error(f"Invalid webhook signature with both secrets. Got: {signature_header}")
+                    return jsonify({"error": "Invalid signature"}), 401
+            else:
+                logger.error(f"Invalid webhook signature. Got: {signature_header}")
+                return jsonify({"error": "Invalid signature"}), 401
+    
     except Exception as e:
-        logger.error(f"Error verifying webhook signature: {e}")
-        # Fall back to the original verification
+        logger.error(f"Error in webhook signature verification: {e}")
+        # Fall back to original verification method
         if not verify_webhook_signature(payload, signature_header):
-            logger.error(f"Invalid webhook signature. Got: {signature_header}")
+            logger.error(f"Fallback signature verification failed. Got: {signature_header}")
             return jsonify({"error": "Invalid signature"}), 401
+        else:
+            logger.info("Fallback signature verification succeeded")
     
     try:
         # Parse the JSON payload
@@ -984,13 +1312,19 @@ def webhook_handler():
         # Check app_id for platform-specific identifiers
         app_id = data.get('app_id', '')
         if app_id:
-            if 'base' in app_id.lower():
+            # Just use 'base' in name check for app_id
+            logger.info(f"Checking app_id '{app_id}' for Base platform indicators")
+            if app_id == 'ol9hno6x':
+                platform = "base"
+                logger.info(f"Detected Base platform from app_id exact match: {app_id}")
+            elif 'base' in app_id.lower():
                 platform = "base"
                 logger.info(f"Detected Base platform from app_id: {app_id}")
-        
+                
         # Check workspace_id for platform-specific identifiers
         workspace_id = data.get('data', {}).get('item', {}).get('workspace_id', '')
         if workspace_id:
+            logger.info(f"Checking workspace_id '{workspace_id}' for Base platform indicators")
             if 'base' in workspace_id.lower():
                 platform = "base"
                 logger.info(f"Detected Base platform from workspace_id: {workspace_id}")
@@ -998,10 +1332,24 @@ def webhook_handler():
         # Set the appropriate API client based on the detected platform
         if platform == "base":
             logger.info("Using Base Intercom API client for this webhook")
-            current_intercom_api = IntercomAPI(base_token, intercom_admin_id)
+            # Check if there's a special Base-specific API URL in the environment
+            base_api_url = os.environ.get("BASE_INTERCOM_API_URL", "https://api.intercom.io")
+            current_intercom_api = IntercomAPI(base_token, intercom_admin_id, base_url=base_api_url)
+            
+            # Important: Store the platform in the data for later reference
+            if 'data' in data and 'item' in data['data']:
+                if 'metadata' not in data['data']['item']:
+                    data['data']['item']['metadata'] = {}
+                data['data']['item']['metadata']['platform'] = 'base'
         else:
             logger.info("Using Reportz Intercom API client for this webhook")
             current_intercom_api = intercom_api  # Default API client (Reportz)
+            
+            # Important: Store the platform in the data for later reference
+            if 'data' in data and 'item' in data['data']:
+                if 'metadata' not in data['data']['item']:
+                    data['data']['item']['metadata'] = {}
+                data['data']['item']['metadata']['platform'] = 'reportz'
         
         # Process the webhook data
         topic = data.get('topic', '')
@@ -1068,6 +1416,38 @@ def webhook_handler():
             # We don't need to do anything specific here
             return jsonify({"status": "acknowledged"}), 200
             
+        # Handle admin replies
+        elif topic == 'conversation.admin.replied':
+            logger.info(f"Admin replied to conversation {conversation_id}")
+            # Check if it's our bot or another admin
+            conversation_parts = item.get('conversation_parts', {}).get('conversation_parts', [])
+            if conversation_parts:
+                latest_part = conversation_parts[0]
+                author = latest_part.get('author', {})
+                admin_id = author.get('id')
+                
+                if admin_id == intercom_admin_id:
+                    logger.info(f"Skipping message from our bot in conversation {conversation_id}")
+                    return jsonify({"status": "bot_message_skipped"}), 200
+                else:
+                    logger.info(f"Human admin {admin_id} replied to conversation {conversation_id}")
+                    
+                    # Check for takeover phrases
+                    body = latest_part.get('body', '')
+                    if TAKEOVER_PHRASE.lower() in body.lower():
+                        logger.info(f"Human admin taking over conversation {conversation_id}")
+                        handle_human_takeover(conversation_id, admin_id)
+                        return jsonify({"status": "human_takeover"}), 200
+                    
+                    # Check for reactivation phrases
+                    if ACTIVATION_PHRASE.lower() in body.lower():
+                        logger.info(f"Human admin reactivated AI for conversation {conversation_id}")
+                        remove_human_takeover(conversation_id)
+                        return jsonify({"status": "ai_reactivated"}), 200
+            
+            # For any other admin reply, we don't need to do anything specific
+            return jsonify({"status": "admin_reply_acknowledged"}), 200
+            
         # Other events - process if they have a new message
         elif 'conversation_part' in item:
             part = item.get('conversation_part', {})
@@ -1106,6 +1486,10 @@ def webhook_handler():
         
         # Track webhook handling time if we get to the end
         track_performance('webhook_handling', webhook_start_time, conversation_id)
+        
+        # Default return for any unhandled event types
+        logger.info(f"Acknowledging unhandled event type: {topic}")
+        return jsonify({"status": "acknowledged"}), 200
         
     except Exception as e:
         # Still track performance even if there's an error
@@ -1450,6 +1834,17 @@ def oauth_callback():
 
 def register_webhook(intercom_api):
     """Register the webhook with Intercom after OAuth"""
+    logger.info("Skipping automatic webhook registration - webhooks configured manually")
+    logger.info("Please ensure webhooks are configured in Intercom for the following events:")
+    logger.info("- conversation.user.created")
+    logger.info("- conversation.user.replied")
+    logger.info("- conversation.admin.assigned")
+    logger.info("- conversation.admin.replied")
+    logger.info("- conversation.admin.closed")
+    return
+    
+    # The rest of the function below is skipped due to API changes
+    # This code remains for reference but will not execute
     try:
         # Check if webhook is already registered
         logger.info("Checking existing webhooks")
@@ -1461,10 +1856,30 @@ def register_webhook(intercom_api):
             "Content-Type": "application/json"
         }
         
-        response = requests.get("https://api.intercom.io/webhooks", headers=headers)
-        response.raise_for_status()
+        # Try the new subscriptions API endpoint first
+        try:
+            response = requests.get("https://api.intercom.io/subscriptions", headers=headers)
+            response.raise_for_status()
+            webhook_endpoint = "https://api.intercom.io/subscriptions"
+            get_webhooks_path = "subscriptions"
+            create_webhook_path = "subscriptions"
+            data_key = "data"
+            logger.info("Using new subscriptions API endpoint")
+            is_subscriptions_api = True
+        except requests.exceptions.HTTPError as e:
+            # Fall back to the old webhooks API endpoint
+            logger.info(f"New subscriptions API not available, falling back to webhooks API: {e}")
+            webhook_endpoint = "https://api.intercom.io/webhooks"
+            get_webhooks_path = "webhooks"
+            create_webhook_path = "webhooks"
+            data_key = "data"
+            is_subscriptions_api = False
+            
+            # Try the old webhook endpoint
+            response = requests.get(webhook_endpoint, headers=headers)
+            response.raise_for_status()
         
-        webhooks = response.json().get("data", [])
+        webhooks = response.json().get(data_key, [])
         webhook_url = f"{webhook_base_url}/webhook/intercom"
         
         # Check if our webhook is already registered
@@ -1486,13 +1901,23 @@ def register_webhook(intercom_api):
             "conversation.admin.closed"
         ]
         
-        webhook_data = {
-            "url": webhook_url,
-            "topics": topics
-        }
+        if is_subscriptions_api:
+            # Format for new subscriptions API
+            webhook_data = {
+                "service_type": "web",
+                "url": webhook_url,
+                "topics": topics,
+                "active": True
+            }
+        else:
+            # Format for old webhooks API
+            webhook_data = {
+                "url": webhook_url,
+                "topics": topics
+            }
         
         response = requests.post(
-            "https://api.intercom.io/webhooks",
+            webhook_endpoint,
             headers=headers,
             json=webhook_data
         )
@@ -2037,10 +2462,6 @@ def test_gpt_trainer():
 
 def process_webhook_conversation_messages(data, current_intercom_api=None):
     """Process the conversation messages from a webhook notification"""
-    # Use the provided API client, or default to the main Intercom API client
-    if not current_intercom_api:
-        current_intercom_api = intercom_api
-    
     # Extract conversation ID from notification data
     conversation_id = data.get('data', {}).get('item', {}).get('id')
     
@@ -2048,17 +2469,115 @@ def process_webhook_conversation_messages(data, current_intercom_api=None):
     if not conversation_id:
         logger.error("No conversation ID found in webhook data")
         return
-        
-    logger.info(f"Processing webhook notification for conversation {conversation_id}")
+    
+    # Identify which platform this is using by checking the data structure
+    platform = "unknown"
+    app_id = data.get('app_id', '')
+    workspace_id = data.get('data', {}).get('item', {}).get('workspace_id', '')
+    
+    if app_id == 'ol9hno6x' or 'base' in workspace_id.lower():
+        platform = "base"
+        # For Base, ensure we're using the Base API client
+        base_token = os.environ.get("BASE_INTERCOM_ACCESS_TOKEN")
+        base_api_url = os.environ.get("BASE_INTERCOM_API_URL", "https://api.intercom.io")
+        if base_token:
+            current_intercom_api = IntercomAPI(base_token, intercom_admin_id, base_url=base_api_url)
+            logger.info(f"Using Base-specific API client for conversation: {conversation_id}")
+    else:
+        platform = "reportz"
+        # If not explicitly Base, use the default Reportz API client
+        if not current_intercom_api:
+            current_intercom_api = intercom_api
+    
+    # Log the conversation ID and API token (truncated for security)
+    api_token = current_intercom_api.access_token if current_intercom_api else "Unknown"
+    logger.info(f"Processing webhook notification for conversation {conversation_id} using API token starting with: {api_token[:10]}")
+    logger.info(f"Detected platform: {platform} for conversation: {conversation_id}")
     
     # Try to get the full conversation details
     try:
         logger.info(f"Getting details for conversation {conversation_id}")
-        conversation = current_intercom_api.get_conversation(conversation_id)
         
-        # Add the message to the batch processing queue
-        add_to_message_batch(conversation_id, conversation, current_intercom_api)
+        # Log the base URL being used
+        base_url = current_intercom_api.base_url
+        logger.info(f"Using Intercom API base URL: {base_url}")
         
+        # Try to get full conversation
+        try:
+            conversation = current_intercom_api.get_conversation(conversation_id)
+            logger.info(f"Successfully retrieved conversation {conversation_id}")
+            
+            # Extract user information
+            user_info = extract_user_info(conversation)
+            logger.info(f"User info for conversation {conversation_id}: {user_info}")
+            
+            # Add user info to conversation metadata
+            if 'metadata' not in conversation:
+                conversation['metadata'] = {}
+            conversation['metadata']['user_info'] = user_info
+            
+            # Add platform info to metadata
+            conversation['metadata']['platform'] = platform
+            
+            # Extract the last user message if available for Mem0 search
+            last_user_message = ""
+            conversation_parts = conversation.get('conversation_parts', {}).get('conversation_parts', [])
+            
+            for part in reversed(conversation_parts):
+                if part.get('author', {}).get('type') == 'user':
+                    last_user_message = part.get('body', '')
+                    break
+                    
+            if not last_user_message and conversation.get('conversation_message', {}).get('author', {}).get('type') == 'user':
+                last_user_message = conversation.get('conversation_message', {}).get('body', '')
+            
+            # Clean HTML tags from the message
+            clean_message = ""
+            if last_user_message:
+                clean_message = re.sub(r'<[^>]+>', '', last_user_message)
+                logger.info(f"Extracted user message: {clean_message[:100]}...")
+                
+                # Search Mem0 for relevant context
+                memories = search_mem0(clean_message, conversation_id)
+                
+                # If memories found, prepare them for inclusion in GPT context
+                memory_context = ""
+                if memories:
+                    memory_context = "Previous information about this conversation:\n"
+                    for idx, memory in enumerate(memories):
+                        memory_context += f"{idx+1}. {memory.get('memory', '')}\n"
+                    
+                    logger.info(f"Adding {len(memories)} memories to context for conversation {conversation_id}")
+                    
+                    # Store memory context in conversation data for use during message processing
+                    conversation['metadata']['memory_context'] = memory_context
+            
+            # Add the message to the batch processing queue
+            add_to_message_batch(conversation_id, conversation, current_intercom_api)
+            
+        except requests.exceptions.HTTPError as e:
+            # If we get a 404, the conversation might not exist on this platform
+            if e.response.status_code == 404:
+                logger.error(f"Conversation {conversation_id} not found on platform {platform}. " +
+                           f"This might be a conversation from a different Intercom workspace.")
+                
+                # For Base conversations, try to process directly from webhook data
+                if platform == "base":
+                    logger.info(f"Attempting to process Base conversation directly from webhook data")
+                    item = data.get('data', {}).get('item', {})
+                    if item:
+                        # Add platform info to the item
+                        if 'metadata' not in item:
+                            item['metadata'] = {}
+                        item['metadata']['platform'] = platform
+                        
+                        # Add the message to the batch processing queue
+                        add_to_message_batch(conversation_id, item, current_intercom_api)
+                
+            else:
+                # Re-raise for other HTTP errors
+                raise
+                
     except Exception as e:
         logger.error(f"Error getting conversation: {str(e)}")
         track_performance("error_fetching_conversation", webhook_start_time, conversation_id,
@@ -2126,35 +2645,197 @@ def is_from_bot(data):
     
     return False
 
-def verify_webhook_signature_with_secret(payload, signature_header, secret):
-    """Verify that the webhook request is from Intercom using a specific client secret"""
-    if not secret:
-        logger.warning("No client secret provided for signature verification")
-        return False
+def extract_message_text(message_data):
+    """
+    Extract the actual message text from either a JSON object or plain text.
     
-    if not signature_header:
-        logger.warning("No signature header in request")
-        return False
+    Args:
+        message_data: The message data, either a string or a JSON object
+        
+    Returns:
+        str: The extracted message text
+    """
+    # If message is already a string, return it directly
+    if isinstance(message_data, str):
+        return message_data
+        
+    # If it's a conversation object, extract from appropriate fields
+    try:
+        # Check for conversation_message first (initial message)
+        if 'conversation_message' in message_data:
+            body = message_data.get('conversation_message', {}).get('body', '')
+            if body:
+                return body
+        
+        # Check for body field directly (simpler messages)
+        if 'body' in message_data:
+            return message_data.get('body', '')
+            
+        # Check for conversation parts (subsequent messages)
+        parts = message_data.get('conversation_parts', {}).get('conversation_parts', [])
+        if parts:
+            # Get the most recent part with a body
+            for part in reversed(parts):
+                if part.get('part_type') == 'comment' and part.get('body'):
+                    return part.get('body', '')
+                    
+        # Look for source field with body (initial message from webhook)
+        source = message_data.get('source', {})
+        if source and 'body' in source:
+            return source.get('body', '')
+        
+        # If we can't find the text in expected places, return the object as string
+        logger.warning(f"Could not extract text from message data structure, using string representation")
+        return str(message_data)
+        
+    except Exception as e:
+        logger.error(f"Error extracting message text: {e}")
+        return str(message_data)  # Fallback to string representation
+
+def extract_user_info(conversation):
+    """
+    Extract user information from an Intercom conversation
     
-    if not signature_header.startswith('sha1='):
-        logger.warning("Invalid signature format")
-        return False
+    Args:
+        conversation: The Intercom conversation object
+        
+    Returns:
+        dict: User information including name, email, and platform
+    """
+    user_info = {
+        "name": "Unknown User",
+        "email": "",
+        "platform": "unknown"
+    }
     
-    signature = signature_header[5:]  # Remove 'sha1=' prefix
-    
-    # Create hmac with the provided client secret
-    mac = hmac.new(
-        secret.encode('utf-8'),
-        msg=payload.encode('utf-8'),
-        digestmod=hashlib.sha1
-    )
-    
-    # Compare signatures
-    calculated_signature = mac.hexdigest()
-    logger.debug(f"Calculated signature: {calculated_signature}")
-    logger.debug(f"Received signature: {signature}")
-    
-    return hmac.compare_digest(calculated_signature, signature)
+    try:
+        # Log the conversation structure for debugging
+        logger.info(f"DEBUG - Extracting user info from conversation: {conversation.get('id')}")
+        logger.info(f"DEBUG - Conversation keys: {list(conversation.keys())}")
+        
+        # Determine platform (Reportz or Base)
+        platform = "unknown"
+        
+        # Check for platform indicators in the conversation
+        conversation_tags = conversation.get("tags", {}).get("tags", [])
+        if any(tag.get("name", "").lower() == "base.me" for tag in conversation_tags):
+            platform = "Base"
+            logger.info(f"DEBUG - Detected Base platform from tags")
+        else:
+            # Check conversation title
+            title = conversation.get("title", "").lower() or ""
+            logger.info(f"DEBUG - Conversation title: {title}")
+            if "base.me" in title or "base" in title:
+                platform = "Base"
+                logger.info(f"DEBUG - Detected Base platform from title")
+            else:
+                # Try to determine from conversation_id format
+                conversation_id = conversation.get("id", "")
+                if conversation_id and isinstance(conversation_id, (int, str)) and len(str(conversation_id)) <= 6:
+                    platform = "Base"
+                    logger.info(f"DEBUG - Detected Base platform from conversation ID format: {conversation_id}")
+                else:
+                    # Manual check: Base conversations typically have IDs that are 5-6 digits
+                    # Reportz conversations have longer IDs like: 63371900205536
+                    # Check the source field for workspace information
+                    workspace_id = conversation.get("workspace_id", "")
+                    if workspace_id:
+                        if "base" in workspace_id.lower():
+                            platform = "Base"
+                            logger.info(f"DEBUG - Detected Base platform from workspace ID: {workspace_id}")
+                        else:
+                            platform = "Reportz"
+                            logger.info(f"DEBUG - Detected Reportz platform from workspace ID: {workspace_id}")
+                    else:
+                        # Check if this was fetched with the Base API token
+                        # This is a fallback mechanism
+                        if hasattr(current_intercom_api, 'access_token'):
+                            base_token = os.environ.get("BASE_INTERCOM_ACCESS_TOKEN", "")
+                            if base_token and current_intercom_api.access_token == base_token:
+                                platform = "Base"
+                                logger.info(f"DEBUG - Detected Base platform from API token used")
+                            else:
+                                platform = "Reportz"
+                                logger.info(f"DEBUG - Detected Reportz platform from API token used")
+                        else:
+                            # Default to Reportz if no Base indicators
+                            platform = "Reportz"
+                            logger.info(f"DEBUG - Defaulting to Reportz platform")
+        
+        user_info["platform"] = platform
+        logger.info(f"DEBUG - Set platform to: {platform}")
+        
+        # Extract user's contact information from source (which is more consistently populated)
+        source = conversation.get("source", {})
+        source_author = source.get("author", {})
+        
+        if source_author and source_author.get("type") == "user":
+            logger.info(f"DEBUG - Found source author: {json.dumps(source_author)}")
+            
+            # Get name
+            name = source_author.get("name", "")
+            if name:
+                user_info["name"] = name
+                logger.info(f"DEBUG - Found user name from source: {name}")
+            
+            # Get email
+            email = source_author.get("email", "")
+            if email:
+                user_info["email"] = email
+                logger.info(f"DEBUG - Found user email from source: {email}")
+        
+        # If name still not found, try contacts
+        if user_info["name"] == "Unknown User":
+            contacts = conversation.get("contacts", {}).get("contacts", [])
+            logger.info(f"DEBUG - Found {len(contacts) if contacts else 0} contacts")
+            
+            if contacts and len(contacts) > 0:
+                contact = contacts[0]  # Get the first contact
+                contact_id = contact.get("id")
+                logger.info(f"DEBUG - Contact ID: {contact_id}")
+                
+                # If needed, we could make another API call to get full contact details
+                # But let's try other methods first
+                
+                # Extract name if available directly
+                name = contact.get("name", "")
+                if name:
+                    user_info["name"] = name
+                    logger.info(f"DEBUG - Found user name from contact: {name}")
+        
+        # Additional fallback methods to get user info
+        if not user_info["name"] or user_info["name"] == "Unknown User":
+            # Check for user name in the initial message author
+            initial_author = conversation.get("conversation_message", {}).get("author", {})
+            logger.info(f"DEBUG - Initial author: {json.dumps(initial_author)}")
+            
+            if initial_author.get("type") == "user" and initial_author.get("name"):
+                user_info["name"] = initial_author.get("name")
+                logger.info(f"DEBUG - Found user name from initial author: {initial_author.get('name')}")
+                
+                # Also check for email in initial author
+                if initial_author.get("email") and not user_info["email"]:
+                    user_info["email"] = initial_author.get("email")
+                    logger.info(f"DEBUG - Found user email from initial author: {initial_author.get('email')}")
+        
+        # Check for contact info in user field (yet another place it could be)
+        user = conversation.get("user", {})
+        if user:
+            logger.info(f"DEBUG - User field exists with keys: {list(user.keys())}")
+            if user.get("name") and user_info["name"] == "Unknown User":
+                user_info["name"] = user.get("name")
+                logger.info(f"DEBUG - Found user name from user field: {user.get('name')}")
+            if user.get("email") and not user_info["email"]:
+                user_info["email"] = user.get("email")
+                logger.info(f"DEBUG - Found user email from user field: {user.get('email')}")
+        
+        # Log final extracted user info
+        logger.info(f"DEBUG - Final extracted user info: {json.dumps(user_info)}")
+        
+        return user_info
+    except Exception as e:
+        logger.error(f"Error extracting user info: {e}", exc_info=True)
+        return user_info
 
 if __name__ == '__main__':
     # Get public webhook URL

@@ -1,6 +1,7 @@
 import requests
 import time
 import logging
+import json
 from utils.retry import retry
 
 logger = logging.getLogger(__name__)
@@ -8,22 +9,25 @@ logger = logging.getLogger(__name__)
 class IntercomAPI:
     """API client for Intercom"""
     
-    def __init__(self, token, admin_id):
+    def __init__(self, token, admin_id, base_url=None):
         """Initialize the API client
         
         Args:
             token (str): Intercom API token
             admin_id (str): Intercom admin ID for sending replies
+            base_url (str, optional): Custom API base URL. Defaults to the standard Intercom API URL.
         """
         self.access_token = token
         self.admin_id = admin_id
-        self.base_url = "https://api.intercom.io"
+        self.base_url = base_url or "https://api.intercom.io"
         self.headers = {
             "Authorization": f"Bearer {self.access_token}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
         
         logging.info(f"Initialized Intercom API client with admin ID: {admin_id}")
+        logging.info(f"Using API base URL: {self.base_url}")
         logging.info(f"API Token (truncated): {token[:10]}...")
     
     def update_token(self, new_token):
@@ -61,7 +65,13 @@ class IntercomAPI:
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error listing conversations: {e}")
             raise
-        except Exception as e:
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error listing conversations: {e}")
+            raise
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Timeout listing conversations: {e}")
+            raise
+        except requests.exceptions.RequestException as e:
             logger.error(f"Error listing conversations: {e}")
             raise
     
@@ -70,17 +80,27 @@ class IntercomAPI:
         """Get a specific conversation by ID"""
         try:
             url = f"{self.base_url}/conversations/{conversation_id}"
+            logger.debug(f"Getting conversation {conversation_id} from {url}")
+            
             response = requests.get(url, headers=self.headers)
-            self._handle_rate_limits(response)
+            
+            logger.debug(f"Response status code: {response.status_code}")
+            
             response.raise_for_status()
             
             return response.json()
             
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error getting conversation {conversation_id}: {e}")
+            logger.error(f"HTTP error retrieving conversation {conversation_id}: {e}")
             raise
-        except Exception as e:
-            logger.error(f"Error getting conversation {conversation_id}: {e}")
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error retrieving conversation {conversation_id}: {e}")
+            raise
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Timeout retrieving conversation {conversation_id}: {e}")
+            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error retrieving conversation {conversation_id}: {e}")
             raise
     
     @retry(max_attempts=3, initial_delay=1.0, backoff_factor=2.0, max_delay=10.0)
@@ -97,8 +117,11 @@ class IntercomAPI:
                 "body": f"<p>{message}</p>"
             }
             
+            logger.debug(f"Replying to conversation {conversation_id}")
             response = requests.post(url, headers=self.headers, json=payload)
-            self._handle_rate_limits(response)
+            
+            logger.debug(f"Response status code: {response.status_code}")
+            
             response.raise_for_status()
             
             return response.json()
@@ -106,7 +129,13 @@ class IntercomAPI:
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error replying to conversation {conversation_id}: {e}")
             raise
-        except Exception as e:
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error replying to conversation {conversation_id}: {e}")
+            raise
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Timeout replying to conversation {conversation_id}: {e}")
+            raise
+        except requests.exceptions.RequestException as e:
             logger.error(f"Error replying to conversation {conversation_id}: {e}")
             raise
     
